@@ -1,10 +1,10 @@
 ---
 name: mini-apps
-description: "FIRST DRAFT, needs review. Many rules are too prescriptive; treat them as defaults to question. Build lightweight team apps as a single index.html (Preact + htm, no build) synced through TinyBase on a Cloudflare Worker, with an optional zero-dependency server.mjs and Giga for credentials and tools."
+description: "FIRST DRAFT, needs review. Many rules are too prescriptive; treat them as defaults to question. Build lightweight team apps as a single index.html (Preact + htm, no build) synced through TinyBase on a Cloudflare Worker, with an optional zero-dependency server.mjs. Optionally uses Giga for credentials and tools."
 ---
 
 > **⚠️ First draft: needs review before relying on it.**
-> This was written in one go from a single project (Magnet). Several rules are more prescriptive than they should be, and some details (the Worker code, hosting, per-person vs team credentials) haven't been checked. Treat everything below as **sensible defaults, not requirements**: deviate whenever the app needs it, and flag anything that seems wrong so the skill can be corrected.
+> This was written in one go from a single project (Magnet). Several rules are more prescriptive than they should be, and some details (room protection, hosting, per-person vs team credentials) haven't been settled. Treat everything below as **sensible defaults, not requirements**: deviate whenever the app needs it, and flag anything that seems wrong so the skill can be corrected.
 
 # Mini Apps
 
@@ -22,7 +22,7 @@ app/
   server.mjs     optional: node server.mjs → http://localhost:3000
   md/            content as Markdown (guides, hubs), loaded at runtime
   .env           optional server keys, gitignored
-  .oauth.json    OAuth tokens (server only), gitignored
+  .oauth.json    OAuth tokens (server only, only if you use Giga), gitignored
 ```
 
 - **Order inside `index.html`:** imports → constants/config → store and sync → data helpers → small components → pages → routing → `App` → `render`.
@@ -107,20 +107,22 @@ app/
 
 ### The Worker
 
-The Cloudflare Worker is TinyBase's WebSocket server running in a Durable Object, which also persists each room. This is the standard shape; check it against your deployed Worker:
+The sync server is [tonyennis145/tinybase-cloudflare-worker](https://github.com/tonyennis145/tinybase-cloudflare-worker): TinyBase's WebSocket server running in a Cloudflare Durable Object, with each room saved in the Durable Object's SQLite storage. Its README covers deploying it (Cloudflare dashboard or `wrangler deploy`) and running it locally. The whole Worker:
 
 ```js
 import { createMergeableStore } from 'tinybase';
-import { createDurableObjectStoragePersister } from 'tinybase/persisters/persister-durable-object-storage';
+import { createDurableObjectSqlStoragePersister } from 'tinybase/persisters/persister-durable-object-sql-storage';
 import { WsServerDurableObject, getWsServerDurableObjectFetch } from 'tinybase/synchronizers/synchronizer-ws-server-durable-object';
 
-export class TinyBaseRooms extends WsServerDurableObject {
-  createPersister() { return createDurableObjectStoragePersister(createMergeableStore(), this.ctx.storage); }
+export class TinyBaseDurableObject extends WsServerDurableObject {
+  createPersister() { return createDurableObjectSqlStoragePersister(createMergeableStore(), this.ctx.storage.sql); }
 }
-export default { fetch: getWsServerDurableObjectFetch('TinyBaseRooms') };
+export default { fetch: getWsServerDurableObjectFetch('TINYBASE') };
 ```
 
-In `wrangler.toml`, add a Durable Object binding named `TinyBaseRooms` for the class `TinyBaseRooms`, plus a migration for it. One Worker serves many apps: each room is its own Durable Object.
+- **One Worker serves every app.** Each URL path is its own room (its own Durable Object), created on first connect. Give each app its own room name.
+- **Use the same TinyBase version in the Worker and the app.**
+- **The Worker has no authentication,** so a room is readable by anyone who knows its URL (see the store rules above).
 
 ## 6. server.mjs (only when needed)
 
@@ -137,9 +139,43 @@ In `wrangler.toml`, add a Durable Object binding named `TinyBaseRooms` for the c
 - **Serve only `index.html` and `md/*.md`,** with a strict filename check, `cache-control: no-store` and nothing else. Never `.env` or other files.
 - **Return data ready to use;** business logic can live in the browser. The server exists for secrets, CORS and signing, not for app logic.
 
-## 7. Credentials: Giga first
+## 7. Credentials and API keys
 
-The **Config** page, in order:
+- **A Config page** (reached from the `⋯` menu) has one card per external service: what it's for, what in the app uses it (`usedBy`), and where its key comes from.
+- **Keys come from `.env` on the server,** or from **team keys** pasted on the Config page:
+  - Encrypt pasted keys with a team code: AES-GCM, with a key derived via PBKDF2.
+  - Keep them in a synced `secrets` table, decrypted only in the browser.
+  - The browser sends them to the server per request in a header. The server falls back to `.env`, and never saves a pasted key to disk.
+- **Every call to a keyed service goes through one function,** `keyedFetch(provider, url, opts)`:
+  - Each provider declares its auth scheme once: `PROVIDER_AUTH[p] = { header: (key) => ({ 'x-api-key': key }) }`.
+  - It returns a fetch-like `{ ok, status, json(), text(), via }`, where `via` says which key was used ("team key", ".env key").
+  - Log every call with its source, e.g. `[apify] POST api.apify.com via .env key: HTTP 201`. When something fails, that line answers "which key was it using?".
+- **Test a key with a free, read-only call** (an account-info endpoint) before building on it.
+- With Giga connected, each card can use a Giga credential instead of a key. See **Optional: Giga integration** at the end.
+
+## 8. AI features
+
+- **Pattern:** research (deterministic code + APIs) → the AI generates → **the AI grades it against a rubric** → a person approves the batch → code publishes or sends → tracking scores the result.
+- **Graders return JSON** (`response_format: json_object`): a score per factor, a rationale, and the matched ICP. The rubrics live in one object on the server.
+- **Batch work** goes through a shared runner (concurrency ~3) and a job list showing queued / grading / done / failed / skipped. Skip duplicates before running.
+
+## 9. Testing and ways of working
+
+- **Syntax-check the whole front end** by pulling out the module script and running `node --check` on it.
+- **Browser tests use headless Chrome** (`puppeteer-core` with the system Chrome):
+  - **Replace `WebSocket` with a stub** (`evaluateOnNewDocument`) so tests never write to the real room.
+  - For sync tests, redirect to a **throwaway room** (`/<room>-test-<timestamp>`).
+  - Screenshot the result and look at it.
+- **Test against real integrations with read-only or cheap calls,** and say what each one costs.
+- **Time-box investigations.** After ~5 minutes or 2–3 disproved theories, stop and report what's known, what's ruled out and the options. Say how long any test over a minute will take.
+- **Back up a file before a big rewrite,** and confirm before anything destructive or shared (deleting synced data, changing the shared room).
+- **Search before naming a CSS class or route,** to avoid collisions.
+
+## Optional: Giga integration
+
+Skip this section if the app doesn't use [Giga](https://getgiga.com). With it, people sign in to Giga once and use credentials they already keep there, instead of pasting API keys into each app. Giga makes the call and adds the secret itself, so the app never sees it.
+
+The **Config** page then reads, in order:
 1. **Connect Giga** (OAuth).
 2. **Team code**, only if pasted keys are used.
 3. **One card per provider,** each with an **API key | Giga credential** switch.
@@ -165,17 +201,17 @@ The **Config** page, in order:
 - **Each provider declares:**
   - **`slugs`:** which Giga `integration_slug`s count as this provider. Compare them ignoring punctuation (`scrape-creators` = `scrapecreators`).
   - **`usedBy`:** shown on its card.
-  - **Its auth scheme:** `PROVIDER_AUTH[p] = { header: (key) => ({…}), injection: 'header.x-api-key={token}' }`.
+  - **Its auth scheme** (from §7), plus the matching Giga injection rule: `PROVIDER_AUTH[p] = { header: (key) => ({…}), injection: 'header.x-api-key={token}' }`.
 - **Choices are one synced value,** e.g. `{ apify: 'apify-magnet', deepseek: '' }`:
   - a handle means use that Giga credential;
   - `''` means an API key was chosen on purpose;
   - no entry means not chosen yet.
 - **The browser sends the choices with every request** (e.g. an `x-<app>-giga` header).
-- **Every call to a keyed service goes through `keyedFetch(provider, url, opts)`.** It returns a fetch-like `{ ok, status, json(), text(), via }` and picks one of three routes:
+- **`keyedFetch` (from §7) gains two routes,** and picks one of three:
   1. **Giga API credential** → `http_request_with_credential` (pass the provider's `injection_rule`).
   2. **Giga MCP connection** → `invoke_tool`, **only if** the provider declares an `mcp(url) → { tool_id, arguments }` mapping *and* its MCP tools mirror the REST API and return JSON. ScrapeCreators does; Zernio doesn't.
   3. **API key** (team key, or `.env`) → the server makes the call itself.
-- **Always record `via`,** show it in the UI ("fetched via Giga · apify-magnet"), and log it: `[apify] POST api.apify.com via Giga credential apify-magnet: HTTP 201`.
+- **Show `via` in the UI** ("fetched via Giga · apify-magnet") as well as in the log.
 - **Auto-select:**
   - Only for a provider with no API key anywhere and no choice yet.
   - Prefer plain credentials over Pipedream ones, then healthy ones, then the newest.
@@ -185,37 +221,13 @@ The **Config** page, in order:
   - **Pipedream-connected credentials:** only work if Giga's Pipedream plan includes its Connect proxy. Otherwise you get a 403 ("proxy API is not available on your current plan").
   - **MCP credentials:** can't be used for plain requests (`credential_not_http_proxyable`). Use `invoke_tool`, or add the service to Giga again as an API key.
   - **Google:** each OAuth credential only has the scopes it was granted. Use Giga's native Search Console integration (`webmasters.readonly`). Keep Search Console and GA4 as **separate providers**, because they need different scopes.
-- **Test a credential with a free, read-only call** (e.g. an account-info endpoint) before building on it.
+- **Refresh tokens rotate, so refresh one at a time.** Each refresh returns a new refresh token and retires the old one, and re-using a retired one makes Giga revoke the sign-in. Requests often hit an expired token together, so keep one in-flight refresh per connection and let the others wait for it. If a refresh is rejected, mark the connection expired and show **Sign in again**.
 - **Giga's MCP endpoint currently rejects requests from web pages (no CORS),** so using Giga needs `server.mjs` as a thin proxy. If Giga allows the app's web address, the browser can sign in with PKCE and call Giga directly, and the app needs **no server at all**.
-
-### Pasted keys (fallback)
-
-- **Encrypt them with a team code:** AES-GCM with a key derived via PBKDF2.
-- **Keep them in a synced `secrets` table,** decrypted only in the browser.
-- **Send them to the server per request in a header.** The server falls back to `.env`, and never saves a pasted key to disk.
-
-## 8. AI features
-
-- **Pattern:** research (deterministic code + APIs) → the AI generates → **the AI grades it against a rubric** → a person approves the batch → code publishes or sends → tracking scores the result.
-- **Graders return JSON** (`response_format: json_object`): a score per factor, a rationale, and the matched ICP. The rubrics live in one object on the server.
-- **Batch work** goes through a shared runner (concurrency ~3) and a job list showing queued / grading / done / failed / skipped. Skip duplicates before running.
-
-## 9. Testing and ways of working
-
-- **Syntax-check the whole front end** by pulling out the module script and running `node --check` on it.
-- **Browser tests use headless Chrome** (`puppeteer-core` with the system Chrome):
-  - **Replace `WebSocket` with a stub** (`evaluateOnNewDocument`) so tests never write to the real room.
-  - For sync tests, redirect to a **throwaway room** (`/<room>-test-<timestamp>`).
-  - Screenshot the result and look at it.
-- **Test against real integrations with read-only or cheap calls,** and say what each one costs.
-- **Time-box investigations.** After ~5 minutes or 2–3 disproved theories, stop and report what's known, what's ruled out and the options. Say how long any test over a minute will take.
-- **Back up a file before a big rewrite,** and confirm before anything destructive or shared (deleting synced data, changing the shared room).
-- **Search before naming a CSS class or route,** to avoid collisions.
 
 ## Open questions for review
 
-1. **The Worker:** is the code in §5 what's actually deployed? What are the deploy steps, and how should new apps choose a room name?
-2. **Protecting rooms:** anyone with a room URL can read it. Should rooms need a secret token?
+1. **Protecting rooms:** anyone with a room URL can read it. Should rooms need a secret token?
+2. **Room names:** how should new apps choose one (and should it be hard to guess)?
 3. **Hosting:** should there be a default static host (e.g. Cloudflare Pages)?
-4. **Credential choices:** per person, or shared by the team (as here)?
+4. **Giga credential choices:** per person, or shared by the team (as here)?
 5. **Which rules are too prescriptive** (UI patterns, "never", "always") and should be softened or removed?
